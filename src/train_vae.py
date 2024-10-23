@@ -79,13 +79,13 @@ def vae_loss(x, x_reconstructed, mu, logvar):
     return reconstruction_loss + kl_divergence
 
 # Main function to train the model
-def train_model(initial_matrix, noise_level, num_samples, batch_size, hidden_dim, z_dim, epochs, lr, device):
+def train_model(initial_matrix, noise_level, num_samples, batch_size, hidden_dim, z_dim, epochs, lr, wd, device):
     dataset = NoisyMatrixDataset(initial_matrix, noise_level=noise_level, num_samples=num_samples)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
     input_dim = initial_matrix.numel()
     vae = VAE(input_dim, hidden_dim, z_dim).to(device)
-    optimizer = optim.Adam(vae.parameters(), lr=lr, weight_decay=0.1)
+    optimizer = optim.Adam(vae.parameters(), lr=lr, weight_decay=wd)
 
     for epoch in range(epochs):
         for batch_idx, (data, _) in enumerate(dataloader):
