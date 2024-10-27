@@ -4,6 +4,8 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 import argparse
 
+import numpy as np
+
 def initialize_sparse_matrix(shape, sparsity):
     """
     Initialize a sparse binary matrix with a given sparsity level.
@@ -139,9 +141,9 @@ def compute_accuracy(reconstructed_matrix, initial_matrix):
 # Main function to train the model
 def train_model(initial_matrix, noise_level, num_samples, batch_size, hidden_dim, z_dim, epochs, lr, wd, device):
     
-    print("Initial non-zero matrix positions:")
-    for idx in torch.nonzero(initial_matrix, as_tuple=False):
-        print(idx.tolist())
+    # print("Initial non-zero matrix positions:")
+    # for idx in torch.nonzero(initial_matrix, as_tuple=False):
+    #     print(idx.tolist())
     
     dataset = NoisyMatrixDataset(initial_matrix, noise_level=noise_level, num_samples=num_samples)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
@@ -219,37 +221,18 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # Generate initial 4D matrix
-    # Reports x Drugs x Indications x Side Effects
-    # 0         0       0             0
-    # 1         1       0             1
-    # 2         1       0             1
-    # 3         2       0             2
-    # 4         2       0             2
-    # 5         3       0             3
-    # 6         3       0             3
-    # 7         3       0             3
-    # 8         0       0             0
-    # 9         0       0             0
-    # positions = [
-    #     [0, 0, 0, 0],
-    #     [1, 1, 0, 1],
-    #     [2, 1, 0, 1],
-    #     [3, 2, 0, 2],
-    #     [4, 2, 0, 2],
-    #     [5, 3, 0, 3],
-    #     [6, 3, 0, 3],
-    #     [7, 3, 0, 3],
-    #     [8, 0, 0, 0],
-    #     [9, 0, 0, 0]
-    # ]
-    # initial_matrix = torch.zeros((10, 4, 5, 6))
-    # for pos in positions:
-    #     initial_matrix[pos[0], pos[1], pos[2], pos[3]] = 1
-    
-    shape = (10, 4, 5, 4)  # Shape of the 4D matrix
-    
-    initial_matrix = initialize_sparse_matrix(shape, args.sparsity)
+    nreports = 100
+    ndrugs = 10
+    nreactions = 11
+    nindications = 12
+
+    drugs = np.random.binomial(1, args.sparsity, size=(nreports, ndrugs))
+    reactions = np.random.binomial(1, args.sparsity, size=(nreports, nreactions))
+    indications = np.random.binomial(1, args.sparsity, size=(nreports, nindications))
+    data = np.hstack([drugs, reactions, indications])
+    print(data.shape)
+
+    initial_matrix = torch.tensor(data, dtype=torch.float)
 
     # Set device
     device = torch.device(f'cuda:{args.gpu_device}' if torch.cuda.is_available() else 'cpu')
