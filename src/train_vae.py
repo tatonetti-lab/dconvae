@@ -4,6 +4,36 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 import argparse
 
+def initialize_sparse_matrix(shape, sparsity):
+    """
+    Initialize a sparse binary matrix with a given sparsity level.
+    
+    Args:
+    - shape (tuple): The shape of the matrix (e.g., (10, 4, 5, 4)).
+    - sparsity (float): The desired sparsity level, where 1.0 means fully sparse (all zeros),
+                        and 0.0 means fully dense (all ones).
+    
+    Returns:
+    - torch.Tensor: A randomly initialized sparse binary matrix with the given sparsity.
+    """
+    assert 0.0 <= sparsity <= 1.0, "Sparsity must be between 0 and 1."
+
+    # Calculate the number of elements that should be set to 1 based on sparsity
+    total_elements = torch.prod(torch.tensor(shape)).item()
+    num_ones = int(total_elements * (1 - sparsity))  # Elements to set to 1
+
+    # Create a flat tensor of zeros
+    matrix = torch.zeros(total_elements)
+
+    # Randomly select positions to set to 1
+    indices = torch.randperm(total_elements)[:num_ones]
+    matrix[indices] = 1
+
+    # Reshape the flat tensor back into the desired shape
+    matrix = matrix.view(*shape)
+
+    return matrix
+
 # Custom Dataset for 4D Noisy Matrix
 class NoisyMatrixDataset(Dataset):
     def __init__(self, original_matrix, noise_level=0.1, num_samples=1000):
@@ -78,25 +108,96 @@ def vae_loss(x, x_reconstructed, mu, logvar):
     kl_divergence = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
     return reconstruction_loss + kl_divergence
 
+def compute_accuracy(reconstructed_matrix, initial_matrix):
+    """
+    Computes the accuracy of the reconstructed matrix compared to the initial matrix.
+    
+    Args:
+    - reconstructed_matrix (torch.Tensor): The reconstructed matrix (binary).
+    - initial_matrix (torch.Tensor): The initial matrix (binary).
+    
+    Returns:
+    - accuracy (float): The accuracy of the reconstructed matrix as a percentage.
+    """
+    # Ensure the matrices are binary
+    reconstructed_matrix = torch.round(reconstructed_matrix)
+    
+    # Check if the dimensions of both matrices are the same
+    assert reconstructed_matrix.size() == initial_matrix.size(), "Matrices must have the same dimensions."
+    
+    # Compare the two matrices element-wise and calculate the number of matches
+    correct_predictions = torch.eq(reconstructed_matrix, initial_matrix).sum().item()
+    
+    # Calculate the total number of elements
+    total_elements = initial_matrix.numel()
+    
+    # Compute accuracy as the percentage of correct predictions
+    accuracy = (correct_predictions / total_elements) * 100
+    
+    return accuracy
+
 # Main function to train the model
 def train_model(initial_matrix, noise_level, num_samples, batch_size, hidden_dim, z_dim, epochs, lr, wd, device):
+    
+    print("Initial non-zero matrix positions:")
+    for idx in torch.nonzero(initial_matrix, as_tuple=False):
+        print(idx.tolist())
+    
     dataset = NoisyMatrixDataset(initial_matrix, noise_level=noise_level, num_samples=num_samples)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
+    # Initialize a tensor to accumulate the sum of all the samples
+    sum_matrix = torch.zeros_like(initial_matrix)
+
+    # Loop through the dataset and sum all examples
+    for data, _ in dataloader:
+        sum_matrix += data.sum(dim=0).view(initial_matrix.size())
+
+    # Compute the average by dividing the sum by the number of samples
+    average_matrix = sum_matrix / num_samples
+
+    # Convert the average matrix to binary by rounding
+    binary_average_matrix = torch.round(average_matrix)
+
+    # print("Average non-zero matrix positions in noisy data:")
+    # for idx in torch.nonzero(binary_average_matrix, as_tuple=False):
+    #     print(idx.tolist())
+
+    print(f"Accuracy for averaged noisy dataset: {compute_accuracy(binary_average_matrix, initial_matrix)}")
+    
     input_dim = initial_matrix.numel()
     vae = VAE(input_dim, hidden_dim, z_dim).to(device)
     optimizer = optim.Adam(vae.parameters(), lr=lr, weight_decay=wd)
 
     for epoch in range(epochs):
+        total_loss = 0
+        total_accuracy = 0
         for batch_idx, (data, _) in enumerate(dataloader):
-            data = data.to(device).float()
+            data = data.to(device).float()  # Convert to float
             optimizer.zero_grad()
+
+            # Forward pass through the VAE
             x_reconstructed, mu, logvar = vae(data)
+
+            # Compute loss and backpropagate
             loss = vae_loss(data, x_reconstructed, mu, logvar)
             loss.backward()
             optimizer.step()
 
-        print(f'Epoch [{epoch+1}/{epochs}], Loss: {loss.item():.4f}')
+            # Accumulate total loss
+            total_loss += loss.item()
+
+            # Compute accuracy for this batch
+            batch_accuracy = compute_accuracy(x_reconstructed, data)
+            total_accuracy += batch_accuracy
+        
+        # Calculate average loss and accuracy for the epoch
+        avg_loss = total_loss / len(dataloader)
+        avg_accuracy = total_accuracy / len(dataloader)
+
+        # Print the results for the epoch
+        if (epoch % int(epochs/10)) == 0:
+            print(f'Epoch [{epoch+1}/{epochs}], Loss: {avg_loss:.4f}, Accuracy: {avg_accuracy:.2f}%')
 
     print("Training complete.")
 
@@ -114,11 +215,41 @@ if __name__ == "__main__":
     parser.add_argument('--lr', type=float, default=0.001, help="Learning rate for the optimizer.")
     parser.add_argument('--gpu_device', type=int, default=0, help="GPU device number (if available).")
     parser.add_argument('--wd', type=float, default=0, help="Weight decay for regularization.")
+    parser.add_argument('--sparsity', type=float, default=0.95, help="Sparsity of the randomly initialized matrix. Default is 0.95, 95% of the matrix will be 0's")
 
     args = parser.parse_args()
 
     # Generate initial 4D matrix
-    initial_matrix = torch.randint(0, 2, (10, 4, 5, 6)).float()
+    # Reports x Drugs x Indications x Side Effects
+    # 0         0       0             0
+    # 1         1       0             1
+    # 2         1       0             1
+    # 3         2       0             2
+    # 4         2       0             2
+    # 5         3       0             3
+    # 6         3       0             3
+    # 7         3       0             3
+    # 8         0       0             0
+    # 9         0       0             0
+    # positions = [
+    #     [0, 0, 0, 0],
+    #     [1, 1, 0, 1],
+    #     [2, 1, 0, 1],
+    #     [3, 2, 0, 2],
+    #     [4, 2, 0, 2],
+    #     [5, 3, 0, 3],
+    #     [6, 3, 0, 3],
+    #     [7, 3, 0, 3],
+    #     [8, 0, 0, 0],
+    #     [9, 0, 0, 0]
+    # ]
+    # initial_matrix = torch.zeros((10, 4, 5, 6))
+    # for pos in positions:
+    #     initial_matrix[pos[0], pos[1], pos[2], pos[3]] = 1
+    
+    shape = (10, 4, 5, 4)  # Shape of the 4D matrix
+    
+    initial_matrix = initialize_sparse_matrix(shape, args.sparsity)
 
     # Set device
     device = torch.device(f'cuda:{args.gpu_device}' if torch.cuda.is_available() else 'cpu')
