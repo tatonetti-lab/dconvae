@@ -18,6 +18,14 @@ import matplotlib.pyplot as plt
 
 import sklearn.metrics
 
+# TODO: Refactor this so that the datasets are created separately from when they're saved to disk.
+# TODO: This will support if/when we want to call the generation directly instead of using the file
+# TODO: system as an intermediary. 
+
+# TODO: Add confounding by co-prescription. 
+# TODO: Add confounding by age.
+# TODO: Add confounding by sex. 
+
 def numpy_safe_json_dump(data, filepath, indent=2):
     """
     Safely saves dictionary containing NumPy types to a JSON file by converting them to Python native types.
@@ -119,7 +127,7 @@ if __name__ == "__main__":
 
     config = copy.deepcopy(args.__dict__)
     config['output_path'] = output_path
-    
+
     ndrugs = args.ndrugs
 
     drugs = list()
