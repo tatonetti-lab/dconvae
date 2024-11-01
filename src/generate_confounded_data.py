@@ -84,7 +84,7 @@ def build_dataframe(matrices, ordered_m1, m1_name, ordered_m2, m2_name, m12label
 
     return pd.DataFrame(dfdata)
 
-def create_dataset(ndrugs, nreactions, nindications, proportion_true, nreports, nexamples):
+def create_dataset(ndrugs, nreactions, nindications, proportion_true, nreports, nexamples, mean_ind_factor=2):
 
     drugs = list()
     for drug in range(ndrugs):
@@ -110,22 +110,26 @@ def create_dataset(ndrugs, nreactions, nindications, proportion_true, nreports, 
     drug_rxn_factors = dict()
     drug_rxn_truth = dict()
     for drug in drug_probs.index:
+        if not drug in drug_rxn_factors:
+            drug_rxn_factors[drug] = dict()
+        if not drug in drug_rxn_truth:
+            drug_rxn_truth[drug] = dict()
+        
         for rxn in rxn_probs.index:
             if np.random.rand() <= proportion_true:
                 # true drug->reactions relationships
                 factor = np.exp(np.random.normal(1, 1))
-                drug_rxn_truth[(drug,rxn)] = 1.0
+                drug_rxn_truth[drug][rxn] = 1.0
             else:
                 # not true relatinoship 
                 factor = np.exp(np.random.normal(0, 0.1))
-                drug_rxn_truth[(drug,rxn)] = 0.0
-            drug_rxn_factors[(drug,rxn)] = factor
+                drug_rxn_truth[drug][rxn] = 0.0
+            drug_rxn_factors[drug][rxn] = factor
 
     drf = list()
     for drug in drug_probs.index:
-        drf.append([drug_rxn_factors[(drug, rxn)] for rxn in rxn_probs.index])
+        drf.append([drug_rxn_factors[drug][rxn] for rxn in rxn_probs.index])
 
-    
     reports = list()
 
     for rid in range(nreports):
@@ -156,16 +160,19 @@ def create_dataset(ndrugs, nreactions, nindications, proportion_true, nreports, 
         ind_rxn_factors = dict()
 
         for ind in ind_probs.index:
+            if not ind in ind_rxn_factors:
+                ind_rxn_factors[ind] = dict()
+
             # randomly select one reaction that this indication will cause
             rxnid = np.random.choice(len(rxn_probs), 1, True)[0]
             rxn = rxn_probs.index[rxnid]
             # indications cause big reactions
-            factor = np.exp(np.random.normal(5, 1))
-            ind_rxn_factors[(ind,rxn)] = factor
+            factor = np.exp(np.random.normal(mean_ind_factor, 1))
+            ind_rxn_factors[ind][rxn] = factor
 
         irf = list()
         for ind in ind_probs.index:
-            irf.append([ind_rxn_factors.get((ind, rxn), 1.0) for rxn in rxn_probs.index])
+            irf.append([ind_rxn_factors[ind].get(rxn, 1.0) for rxn in rxn_probs.index])
 
         # establish correlations between drugs and indications
 
@@ -206,8 +213,8 @@ def create_dataset(ndrugs, nreactions, nindications, proportion_true, nreports, 
         # run some basic evals on the data we just generated
         matrices = compute_matrices(drugs, rxns, num_reports=nreports)
         drug_rxn = build_dataframe(matrices, drug_probs.index, 'drug', rxn_probs.index, 'reaction', minA=1)
-        drug_rxn['factor'] = [drug_rxn_factors[(d,r)] for _, (d, r) in drug_rxn[['drug', 'reaction']].iterrows()]
-        drug_rxn['truth'] = [drug_rxn_truth[(d, r)] for _, (d, r) in drug_rxn[['drug', 'reaction']].iterrows()]
+        drug_rxn['factor'] = [drug_rxn_factors[d][r] for _, (d, r) in drug_rxn[['drug', 'reaction']].iterrows()]
+        drug_rxn['truth'] = [drug_rxn_truth[d][r] for _, (d, r) in drug_rxn[['drug', 'reaction']].iterrows()]
 
         matrices = compute_matrices(inds, rxns, num_reports=nreports)
         ind_rxn = build_dataframe(matrices, ind_probs.index, 'indication', rxn_probs.index, 'reaction', minA=1)
@@ -235,7 +242,12 @@ def create_dataset(ndrugs, nreactions, nindications, proportion_true, nreports, 
         # we only care about whent the relationship between the indication and the reaction is high
         ind_rxn_high = ind_reduced[ind_reduced['PRR_ind_rxn'] > 10]
 
+        if ind_rxn_high.shape[0] == 0:
+            print(f"WARNING: Simulation generated no indication-reaction PRRs above 10. Skipping this example.")
+            continue
+
         dataset['ind_rxn_factors'] = ind_rxn_factors
+        dataset['indication_names'] = list(ind_probs.index)
         dataset['rxns_observed'] = rxns
         dataset['inds'] = inds
         dataset['drug_rxn'] = drug_rxn
@@ -253,7 +265,9 @@ def create_dataset(ndrugs, nreactions, nindications, proportion_true, nreports, 
     
     return {
         'ndrugs': ndrugs,
+        'drug_names': list(drug_probs.index),
         'nreactions': nreactions,
+        'reaction_names': list(rxn_probs.index),
         'nindications': nindications,
         'nreports': nreports,
         'nexamples': nexamples,
@@ -263,7 +277,7 @@ def create_dataset(ndrugs, nreactions, nindications, proportion_true, nreports, 
         'reports': reports,
         'datasets': datasets,
         'drugs': drugs,
-        'rxns': rxns_clean,
+        'rxns': rxns_clean
     }
 
 def parse_args():
@@ -282,7 +296,11 @@ def parse_args():
                         help='Proportion of true drug-reaction relationships (default: 0.10)')
     parser.add_argument('--nexamples', type=int, default=100,
                         help='Number of confounded datasets to create (default: 100)')
+    parser.add_argument('--name', type=str, default=None,
+                        help='Name of the simulation.')
     
+    parser.add_argument('--mean-ind-factor', type=int, default=2,
+                        help='The factor relationship between indications and their reactions. Larger numbers will produce more biased data.')
     
     parser.add_argument('--data-dir', type=str, default='./data',
                         help='Directory for saving output files (default: current directory)')
@@ -293,7 +311,10 @@ if __name__ == "__main__":
 
     args = parse_args()
 
-    run_name  = ''.join(random.choice(string.ascii_uppercase + string.ascii_lowercase + string.digits) for _ in range(8))
+    if args.name is None:
+        run_name  = ''.join(random.choice(string.ascii_uppercase + string.ascii_lowercase + string.digits) for _ in range(8))
+    else:
+        run_name = args.name + '_' + ''.join(random.choice(string.ascii_uppercase + string.ascii_lowercase + string.digits) for _ in range(3))
 
     output_path = os.path.join(args.data_dir, f"{run_name}")
     print(f"Saving data to: {output_path}")
@@ -311,14 +332,19 @@ if __name__ == "__main__":
     proportion_true = args.proportion_true
     nreports = args.nreports
     nexamples = args.nexamples
+    mif = args.mean_ind_factor
 
     # create the dataset
-    result = create_dataset(ndrugs, nreactions, nindications, proportion_true, nreports, nexamples)
+    result = create_dataset(ndrugs, nreactions, nindications, proportion_true, nreports, nexamples, mean_ind_factor=mif)
+
+    # save some information in the config file
+    config['drug_names'] = result['drug_names']
+    config['reaction_names'] = result['reaction_names']
 
     drug_rxn_factors = result['drug_rxn_factors']
 
     plt.figure(figsize=(5,2))
-    plt.hist(drug_rxn_factors.values(), bins=100)
+    plt.hist([value for inner_dict in drug_rxn_factors.values() for value in inner_dict.values()], bins=100)
     plt.title('Distribution of Drug Reaction Factors')
     plt.ylabel('Count')
     plt.xlabel('Factor')
@@ -337,6 +363,10 @@ if __name__ == "__main__":
     ind_output_path = os.path.join(output_path, 'datasets')
     os.makedirs(ind_output_path, exist_ok=True)
 
+    # save the drug factors and truth dictionaries
+    numpy_safe_json_dump(result['drug_rxn_factors'], os.path.join(output_path, 'drug_rxn_factors.json'), indent=2)
+    numpy_safe_json_dump(result['drug_rxn_truth'], os.path.join(output_path, 'drug_rxn_truth.json'), indent=2)
+
     drugs = result['drugs']
     rxns = result['rxns']
     # to load use sparse.load_npz(filepath).toarray()
@@ -351,8 +381,10 @@ if __name__ == "__main__":
         
         ind_rxn_factors = dataset['ind_rxn_factors']
 
+        numpy_safe_json_dump(dataset['ind_rxn_factors'], os.path.join(ind_output_path, f'{i}_ind_rxn_factors.json'), indent=2)
+
         plt.figure(figsize=(5,2))
-        plt.hist(ind_rxn_factors.values(), bins=100)
+        plt.hist([value for inner_dict in ind_rxn_factors.values() for value in inner_dict.values()], bins=100)
         plt.title('Distribution of Indication Reaction Factors')
         plt.ylabel('Count')
         plt.xlabel('Factor')
@@ -373,7 +405,7 @@ if __name__ == "__main__":
         config[f'dataset_{i}']['IndPRR>10'] = dataset['IndPRR>10']
 
         ind_rxn_high = dataset['ind_rxn_high']
-
+        
         plt.figure(figsize=(5,3))
         plt.scatter(ind_rxn_high['PRR_ind_ing'], ind_rxn_high['PRR_ing_rxn'], alpha=0.4)
         plt.xscale('log')
@@ -410,6 +442,7 @@ if __name__ == "__main__":
         config[f'dataset_{i}']['Tc_AUPR'] = dataset['Tc_AUPR']
         config[f'dataset_{i}']['PRR_AUROC'] = dataset['PRR_AUROC']
         config[f'dataset_{i}']['PRR_AUPR'] = dataset['PRR_AUPR']
+        config[f'dataset_{i}']['indication_names'] = dataset['indication_names']
         
     numpy_safe_json_dump(config, os.path.join(output_path, 'config.json'))
 
