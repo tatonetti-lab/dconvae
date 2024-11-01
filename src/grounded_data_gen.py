@@ -8,6 +8,7 @@ from data_classes import get_fears_and_offsides_data
 from tqdm import tqdm
 import scipy.sparse as sp
 from scipy.special import softmax
+from sklearn.utils.extmath import safe_sparse_dot
 """
 Some questions and thoughts that aren't tied to one function
 
@@ -78,6 +79,12 @@ class PharmacovigSyntheticGenerator:
         )
         print("Indication-indication covariance computed")
         
+        # Add drug-indication covariance
+        self.drug_indication_cov = self._compute_normalized_covariance(
+            self.faers.reports_by_drugs, self.faers.reports_by_indications
+        )
+        print("Drug-indication covariance computed")
+        
         print("Computing second order covariances...")
         # Second order covariances
         self.drug_drug_reaction_cov = self._compute_triple_covariance(
@@ -102,11 +109,68 @@ class PharmacovigSyntheticGenerator:
         print("Indication-indication-reaction covariance computed")
         print("All covariance structures computed")
 
+
+
+    def _compute_conditional_probabilities(self, X, Y, epsilon=1e-10):
+        joint_counts = X.T.dot(Y)
+        x_counts = np.asarray(X.sum(axis=0)).ravel() + epsilon
+        conditional_probs = joint_counts.multiply(1 / x_counts[:, None])
+        return conditional_probs.tocsr()
+    
+    def _compute_mutual_information(self, X, Y):
+        """
+        Compute mutual information between all pairs of variables in X and Y.
+
+        Parameters:
+        X: csr_matrix of shape (n_samples, n_features_X)
+        Y: csr_matrix of shape (n_samples, n_features_Y)
+
+        Returns:
+        mi_matrix: csr_matrix of shape (n_features_X, n_features_Y)
+        """
+        print("Computing mutual information...")
+
+        n_samples = X.shape[0]
+        
+        # Compute marginal probabilities p(x=1) and p(y=1)
+        p_x = np.asarray(X.mean(axis=0)).ravel()  # p(x=1)
+        p_y = np.asarray(Y.mean(axis=0)).ravel()  # p(y=1)
+        p_x = np.clip(p_x, 1e-10, 1 - 1e-10)      # Avoid zero probabilities
+        p_y = np.clip(p_y, 1e-10, 1 - 1e-10)      # Avoid zero probabilities
+
+        # Compute joint probability p(x=1, y=1)
+        # co_occurrence: sparse matrix of shape (n_features_X, n_features_Y)
+        co_occurrence = safe_sparse_dot(X.T, Y) / n_samples  # p(x=1, y=1)
+
+        # Convert co_occurrence to COO format for efficient row/col access
+        coo = co_occurrence.tocoo()
+        p_xy = coo.data  # Non-zero joint probabilities p(x=1, y=1)
+
+        # Corresponding marginal probabilities
+        p_x_i = p_x[coo.row]
+        p_y_j = p_y[coo.col]
+
+        # Compute mutual information for non-zero joint probabilities
+        # MI = p(x,y) * log(p(x,y) / (p(x)*p(y)))
+        mi_data = p_xy * (np.log(p_xy) - np.log(p_x_i * p_y_j))
+
+        # Handle any numerical issues
+        mi_data[np.isnan(mi_data)] = 0.0
+        mi_data[np.isinf(mi_data)] = 0.0
+
+        # Build sparse MI matrix
+        mi_matrix = sp.coo_matrix((mi_data, (coo.row, coo.col)), shape=(X.shape[1], Y.shape[1]))
+        
+        # Return MI matrix in CSR format for efficient arithmetic operations
+        mi_matrix_csr = mi_matrix.tocsr()
+        print("Mutual information computation complete")
+        return mi_matrix_csr
+
     def _compute_normalized_covariance(self, X, Y):
         """
         Compute normalized covariance between two sparse matrices using efficient sparse operations.
+        for one year of data runs pretty fast without much compute
         """
-        # Co-occurrence counts as a sparse matrix
         co_occurrence = X.T.dot(Y)
         
         # Marginal sums (1D arrays)
@@ -114,10 +178,11 @@ class PharmacovigSyntheticGenerator:
         y_sum = np.asarray(Y.sum(axis=0)).ravel()
         n = float(X.shape[0])
         
-        # Expected co-occurrence under independence
+        # Expected co-occurrence under independence - 
+        # TODO incorporate dependence with _compute_conditional_probabilities or _compute_mutual_information
         expected = x_sum[:, None] * y_sum[None, :] / n
         
-        # Compute covariance only for non-zero co-occurrences
+        # Compute covariance only for non-zero co-occurrences - this way takes advantage of sparsity
         coo = co_occurrence.tocoo()
         cov_data = (coo.data - expected[coo.row, coo.col]) / n
         
@@ -134,7 +199,6 @@ class PharmacovigSyntheticGenerator:
         # Optionally convert to CSR format for faster arithmetic operations
         return corr.tocsr()
 
-
     def _compute_triple_covariance(self, X, Y, Z):
         """
         Compute three-way covariance tensor using efficient sparse operations.
@@ -143,21 +207,25 @@ class PharmacovigSyntheticGenerator:
         
         # Compute co-occurrences
         XY = X.T.dot(Y)  # Sparse matrix
-        YZ = Y.multiply(Z)  # Element-wise multiplication
-        XYZ = X.T.dot(YZ)  # Sparse matrix
+        YZ = Y.T.dot(Z)  # Changed from Y.multiply(Z) to Y.T.dot(Z)
+        XZ = X.T.dot(Z)  # Compute direct X to Z relationship
         
         # Marginal sums
         x_sum = np.asarray(X.sum(axis=0)).ravel()
         y_sum = np.asarray(Y.sum(axis=0)).ravel()
         z_sum = np.asarray(Z.sum(axis=0)).ravel()
         
+        # Convert XZ to COO format for processing
+        XZ_coo = XZ.tocoo()
+        
         # Expected counts under independence
-        # For each non-zero in XYZ, compute expected value
-        XYZ_coo = XYZ.tocoo()
-        expected_data = (XY[XYZ_coo.row, XYZ_coo.col] * z_sum[XYZ_coo.data.astype(int)]) / n
+        # For each non-zero entry, compute expected value
+        expected_data = np.zeros_like(XZ_coo.data, dtype=float)
+        for idx, (i, j, val) in enumerate(zip(XZ_coo.row, XZ_coo.col, XZ_coo.data)):
+            expected_data[idx] = (x_sum[i] * z_sum[j]) / n
         
         # Compute covariance
-        cov_data = (XYZ_coo.data - expected_data) / n
+        cov_data = (XZ_coo.data - expected_data) / n
         
         # Handle negative covariances if desired
         cov_data = np.maximum(cov_data, 0)
@@ -166,8 +234,8 @@ class PharmacovigSyntheticGenerator:
         # Group by (row, col) pairs
         from collections import defaultdict
         tensor = defaultdict(list)
-        for idx, (i, j, cov) in enumerate(zip(XYZ_coo.row, XYZ_coo.col, cov_data)):
-            tensor[(i, j)].append((XYZ_coo.data[idx], cov))
+        for idx, (i, j, cov) in enumerate(zip(XZ_coo.row, XZ_coo.col, cov_data)):
+            tensor[(i, j)].append((int(XZ_coo.data[idx]), cov))
         
         # Build the tensor
         tensor_dict = {}
@@ -203,8 +271,6 @@ class PharmacovigSyntheticGenerator:
         return jaccard.tocsr()
 
 
-
-
     def generate_true_relationships_offsides(self):
         """
         Generate true drug-reaction relationships with strength scores based on OFFSIDES 
@@ -213,7 +279,7 @@ class PharmacovigSyntheticGenerator:
         and sholuldnt be too hard to hot swap in onsides as the basis for  true relationships
 
         function returns relationships dict with keys as tuples of drug and reaction indices 
-        (indicies corresponding to self.faers.drug2idx and self.faers.reaction2idx)
+        (indicies corresponding to self.faers.drug2index and self.faers.reaction2index)
         values are the PRR, filtered for PRR > 2 - hopefully this counts as strong enough weak supervision?
         also 2 is pretty arbitarty here, if we stick with this we should do some valildation on different thresholds
 
@@ -223,13 +289,13 @@ class PharmacovigSyntheticGenerator:
         
         # Map OFFSIDES concepts to our vocabulary
         for _, row in tqdm(self.offsides.iterrows(), total=len(self.offsides), desc="Processing OFFSIDES data"):
-            if row.PRR > 2:
-                drug_idx = self.faers.drug2idx.get(row.drug_rxnorn_id)
-                reaction_idx = self.faers.reaction2idx.get(row.condition_meddra_id)
+            if float(row.PRR) > 2:
+                drug_idx = self.faers.drug2index.get(row.drug_rxnorn_id)
+                reaction_idx = self.faers.reaction2index.get(row.condition_meddra_id)
                 
                 if drug_idx is not None and reaction_idx is not None:
                     # Use PRR as effect size
-                    relationships[(drug_idx, reaction_idx)] = row.PRR
+                    relationships[(drug_idx, reaction_idx)] = float(row.PRR)
         
         print(f"Generated {len(relationships)} true relationships")
         return relationships
@@ -258,7 +324,21 @@ class PharmacovigSyntheticGenerator:
         for (d, r), effect in tqdm(true_relationships.items(), desc="Processing true relationships"):
             if d == primary_drug and np.random.random() < expit(effect):
                 clean_reactions.add(r)
+        
+        # Ensure at least 1 clean reaction
+        if len(clean_reactions) == 0:
+            # Get all possible reactions for this drug from true relationships
+            possible_reactions = [r for (d,r), effect in true_relationships.items() if d == primary_drug]
+            if possible_reactions:
+                # Add a random reaction from the possible ones
+                clean_reactions.add(np.random.choice(possible_reactions))
+            else:
+                # If no true relationships exist for this drug, sample any random reaction for now since the ground truth data is kinda a mess
+                print("No true relationships found for primary drug, sampling random reaction")
+                clean_reactions.add(np.random.randint(0, self.faers.reports_by_reactions.shape[1]))
+                
         print(f"Generated {len(clean_reactions)} clean reactions")
+        print(f"Clean reactions: {clean_reactions}")
         
         # Prepare clean data
         clean_data = {
@@ -268,20 +348,19 @@ class PharmacovigSyntheticGenerator:
         
         print("\nGenerating confounded data...")
         # Generate confounded data
-
+        
         # Sample co-prescribed drugs using drug-drug covariance
-        drug_cov = self.drug_drug_cov[primary_drug]
-        drug_cov = np.maximum(drug_cov, 0)
+        drug_cov = self.drug_drug_cov[primary_drug].toarray().flatten()
+        drug_cov[drug_cov < 0] = 0
         co_drug_probs = softmax(drug_cov)
         
-        # TODO I think this is a reasonable distribution but lmk, not something I have a lot of conviction on
         n_co_drugs = np.random.poisson(2)  # Average of 2 co-prescribed drugs
         co_drugs = np.random.choice(
-            len(co_drug_probs),
-            size=n_co_drugs,
+            np.arange(len(co_drug_probs)),  # Use explicit integer indices
+            size=min(n_co_drugs, len(co_drug_probs)),
             p=co_drug_probs,
             replace=False
-        )
+        ).astype(int)  # Ensure integer type
         drugs = [primary_drug] + list(co_drugs)
         print(f"Added {len(co_drugs)} co-prescribed drugs")
         
@@ -297,51 +376,60 @@ class PharmacovigSyntheticGenerator:
         print("\nGenerating indications...")
         indications = set()
         for drug in tqdm(drugs, desc="Processing drug indications"):
-            drug_ind_cov = self.drug_indication_cov[drug]
-            drug_ind_cov = np.maximum(drug_ind_cov, 0)
+            drug_ind_cov = self.drug_indication_cov[drug].toarray().flatten()
+            drug_ind_cov[drug_ind_cov < 0] = 0
             if drug_ind_cov.sum() > 0:
                 ind_probs = softmax(drug_ind_cov)
-                sampled_inds = np.random.choice(
-                    len(ind_probs),
-                    size=1,  
-                    p=ind_probs,
-                    replace=False
-                )
-                indications.update(sampled_inds)
+                try:
+                    sampled_inds = np.random.choice(
+                        len(ind_probs),
+                        size=min(1, len(ind_probs)),  # Ensure we don't try to sample more than available
+                        p=ind_probs,
+                        replace=False
+                    )
+                    indications.update(sampled_inds)
+                except ValueError:
+                    continue  # Skip if probabilities don't sum to 1 or other sampling issues
         print(f"Generated {len(indications)} indications")
         
         # Add reactions arising from indications
         print("\nAdding reactions from indications...")
         for ind in tqdm(indications, desc="Processing indication reactions"):
-            ind_rxn_cov = self.indication_reaction_cov[ind]
-            ind_rxn_cov = np.maximum(ind_rxn_cov, 0)
-            if ind_rxn_cov.sum() > 0:
-                rxn_probs = softmax(ind_rxn_cov)
-                n_reactions = np.random.poisson(1)
-                reactions = np.random.choice(
-                    len(rxn_probs),
-                    size=n_reactions,
-                    p=rxn_probs,
-                    replace=False
-                )
-                confounded_reactions.update(reactions)
+            # Get the reactions associated with this indication from the tensor
+            if (ind, ind) in self.drug_indication_reaction_cov:
+                indices, probs = self.drug_indication_reaction_cov[(ind, ind)]
+                try:
+                    n_reactions = np.random.poisson(1)
+                    if n_reactions > 0 and len(indices) > 0:
+                        reactions = np.random.choice(
+                            indices,
+                            size=min(n_reactions, len(indices)),
+                            p=probs,
+                            replace=False
+                        )
+                        confounded_reactions.update(reactions)
+                except ValueError:
+                    continue  # Skip if probabilities don't sum to 1 or other sampling issues
         
         # Add reactions from drug-drug interactions
         print("\nAdding reactions from drug-drug interactions...")
         for i, drug1 in enumerate(drugs):
             for drug2 in drugs[i+1:]:
-                dd_rxn_cov = self.drug_drug_reaction_cov[drug1, drug2]
-                dd_rxn_cov = np.maximum(dd_rxn_cov, 0)
-                if dd_rxn_cov.sum() > 0:
-                    rxn_probs = softmax(dd_rxn_cov)
-                    n_reactions = np.random.poisson(0.5)
-                    reactions = np.random.choice(
-                        len(rxn_probs),
-                        size=n_reactions,
-                        p=rxn_probs,
-                        replace=False
-                    )
-                    confounded_reactions.update(reactions)
+                if (drug1, drug2) in self.drug_drug_reaction_cov:
+                    indices, probs = self.drug_drug_reaction_cov[(drug1, drug2)]
+                    try:
+                        n_reactions = np.random.poisson(0.5)
+                        if n_reactions > 0 and len(indices) > 0:
+                            reactions = np.random.choice(
+                                indices,
+                                size=min(n_reactions, len(indices)),
+                                p=probs,
+                                replace=False
+                            )
+                            confounded_reactions.update(reactions)
+                    except ValueError:
+                        continue  # Skip if probabilities don't sum to 1 or other sampling issues
+        
         print(f"Final number of confounded reactions: {len(confounded_reactions)}")
         
         # Prepare confounded data
@@ -369,120 +457,5 @@ if __name__ == '__main__':
 
 
 
-
-
-
-    # def generate_report(self, true_relationships):
-    #     """
-    #     Generate a single report with both clean and confounded versions
-    #     """
-    #     # weight this by drug frequency
-    #     drug_freqs = self.faers.reports_by_drugs.sum(axis=0).A1
-    #     primary_drug = np.random.choice(self.faers.reports_by_drugs.shape[1], p=normalize(drug_freqs))
-        
-    #     # Sample co-prescribed drugs using drug-drug covariance
-    #     drug_probs = self.drug_drug_cov[primary_drug]
-    #     #SHOULD I ADD SOFTMAX HERE?
-    #     n_drugs = np.random.poisson(2)  # Average of 2 additional drugs
-    #     other_drugs = np.random.choice(
-    #         len(drug_probs),
-    #         size=n_drugs,
-    #         p=normalize(np.maximum(drug_probs, 0)),
-    #         replace=False
-    #     )
-    #     drugs = [primary_drug] + list(other_drugs)
-        
-    #     # Generate clean reactions using true relationships
-    #     clean_reactions = set()
-    #     for drug in drugs:
-    #         # Get reactions from OFFSIDES relationships
-    #         for (d, r), effect in true_relationships.items():
-    #             #TODO could do this for onsides but maybe effect would be random?
-    #             if d == drug and np.random.random() < expit(effect):
-    #                 clean_reactions.add(r)
-            
-    #         # Sample additional reactions using drug-drug-reaction tensor
-    #         #TODO should this be in the clean data or the confounded data?
-    #         for other_drug in drugs:
-    #             if other_drug != drug:
-    #                 rxn_probs = self.drug_drug_reaction_cov[drug, other_drug]
-    #                 n_reactions = np.random.poisson(1)
-    #                 reactions = np.random.choice(
-    #                     len(rxn_probs),
-    #                     size=n_reactions,
-    #                     p=normalize(rxn_probs),
-    #                     replace=False
-    #                 )
-    #                 clean_reactions.update(reactions)
-        
-    #     # Sample indications using drug-indication covariances
-    #     indications = set()
-    #     for drug in drugs:
-    #         ind_probs = self.drug_indication_reaction_cov[drug].sum(axis=1)
-    #         n_indications = np.random.poisson(1)
-    #         drug_indications = np.random.choice(
-    #             len(ind_probs),
-    #             size=n_indications,
-    #             p=normalize(np.maximum(ind_probs, 0)),
-    #             replace=False
-    #         )
-    #         indications.update(drug_indications)
-        
-        
-    #         # Sample co-occurring indications
-    #         #TODO should this be in the clean data or the confounded data? do we need this to be more involved in the other sampling?
-    #         #TODO is there some more cyclical pruning way we could this or use monte carlo some how?
-    #         for ind in drug_indications:
-    #             coind_probs = self.indication_indication_cov[ind]
-    #             n_coinds = np.random.poisson(0.5)
-    #             coindications = np.random.choice(
-    #                 len(coind_probs),
-    #                 size=n_coinds,
-    #                 p=normalize(np.maximum(coind_probs, 0)),
-    #                 replace=False
-    #             )
-    #             indications.update(coindications)
-        
-    #     # Generate confounded reactions
-    #     confounded_reactions = clean_reactions.copy()
-        
-    #     # Add reactions from indications using indication-reaction patterns
-    #     # what else should go here?
-    #     for indication in indications:
-    #         # Direct indication effects
-    #         rxn_probs = self.drug_indication_reaction_cov[:, indication, :].sum(axis=0)
-    #         n_reactions = np.random.poisson(1)
-    #         reactions = np.random.choice(
-    #             len(rxn_probs),
-    #             size=n_reactions,
-    #             p=normalize(np.maximum(rxn_probs, 0)),
-    #             replace=False
-    #         )
-    #         confounded_reactions.update(reactions)
-            
-    #         # Indication pair effects
-    #         for other_ind in indications:
-    #             if other_ind != indication:
-    #                 pair_rxn_probs = self.indication_indication_reaction_cov[indication, other_ind]
-    #                 n_reactions = np.random.poisson(0.5)
-    #                 reactions = np.random.choice(
-    #                     len(pair_rxn_probs),
-    #                     size=n_reactions,
-    #                     p=normalize(np.maximum(pair_rxn_probs, 0)),
-    #                     replace=False
-    #                 )
-    #                 confounded_reactions.update(reactions)
-        
-    #     return {
-    #         'clean': {
-    #             'drugs': list(drugs),
-    #             'reactions': list(clean_reactions)
-    #         },
-    #         'confounded': {
-    #             'drugs': list(drugs),
-    #             'reactions': list(confounded_reactions),
-    #             'indications': list(indications)
-    #         }
-    #     }
 
 
