@@ -112,83 +112,36 @@ class PharmacovigSyntheticGenerator:
 
 
     def _compute_conditional_probabilities(self, X, Y, epsilon=1e-10):
+        # p(y|x) -- compute p(x,y) / p(x)
         joint_counts = X.T.dot(Y)
         x_counts = np.asarray(X.sum(axis=0)).ravel() + epsilon
         conditional_probs = joint_counts.multiply(1 / x_counts[:, None])
         return conditional_probs.tocsr()
     
-    def _compute_mutual_information(self, X, Y):
-        """
-        Compute mutual information between all pairs of variables in X and Y.
-
-        Parameters:
-        X: csr_matrix of shape (n_samples, n_features_X)
-        Y: csr_matrix of shape (n_samples, n_features_Y)
-
-        Returns:
-        mi_matrix: csr_matrix of shape (n_features_X, n_features_Y)
-        """
-        print("Computing mutual information...")
-
-        n_samples = X.shape[0]
-        
-        # Compute marginal probabilities p(x=1) and p(y=1)
-        p_x = np.asarray(X.mean(axis=0)).ravel()  # p(x=1)
-        p_y = np.asarray(Y.mean(axis=0)).ravel()  # p(y=1)
-        p_x = np.clip(p_x, 1e-10, 1 - 1e-10)      # Avoid zero probabilities
-        p_y = np.clip(p_y, 1e-10, 1 - 1e-10)      # Avoid zero probabilities
-
-        # Compute joint probability p(x=1, y=1)
-        # co_occurrence: sparse matrix of shape (n_features_X, n_features_Y)
-        co_occurrence = safe_sparse_dot(X.T, Y) / n_samples  # p(x=1, y=1)
-
-        # Convert co_occurrence to COO format for efficient row/col access
-        coo = co_occurrence.tocoo()
-        p_xy = coo.data  # Non-zero joint probabilities p(x=1, y=1)
-
-        # Corresponding marginal probabilities
-        p_x_i = p_x[coo.row]
-        p_y_j = p_y[coo.col]
-
-        # Compute mutual information for non-zero joint probabilities
-        # MI = p(x,y) * log(p(x,y) / (p(x)*p(y)))
-        mi_data = p_xy * (np.log(p_xy) - np.log(p_x_i * p_y_j))
-
-        # Handle any numerical issues
-        mi_data[np.isnan(mi_data)] = 0.0
-        mi_data[np.isinf(mi_data)] = 0.0
-
-        # Build sparse MI matrix
-        mi_matrix = sp.coo_matrix((mi_data, (coo.row, coo.col)), shape=(X.shape[1], Y.shape[1]))
-        
-        # Return MI matrix in CSR format for efficient arithmetic operations
-        mi_matrix_csr = mi_matrix.tocsr()
-        print("Mutual information computation complete")
-        return mi_matrix_csr
-
+    
     def _compute_normalized_covariance(self, X, Y):
         """
-        Compute normalized covariance between two sparse matrices using efficient sparse operations.
-        for one year of data runs pretty fast without much compute
+        Compute normalized covariance between two sparse matrices using conditional probabilities
         """
+        # Get conditional probabilities P(Y|X)
+        conditional_probs = self._compute_conditional_probabilities(X, Y)
+        
+        # Actual co-occurrence
         co_occurrence = X.T.dot(Y)
         
-        # Marginal sums (1D arrays)
-        x_sum = np.asarray(X.sum(axis=0)).ravel()
-        y_sum = np.asarray(Y.sum(axis=0)).ravel()
         n = float(X.shape[0])
         
-        # Expected co-occurrence under independence - 
-        # TODO incorporate dependence with _compute_conditional_probabilities or _compute_mutual_information
-        expected = x_sum[:, None] * y_sum[None, :] / n
+        # Use conditional probabilities for expected values instead of independence assumption
+        x_sum = np.asarray(X.sum(axis=0)).ravel()
+        expected = conditional_probs.multiply(x_sum[:, None])
         
-        # Compute covariance only for non-zero co-occurrences - this way takes advantage of sparsity
+        # Rest of computation remains the same
         coo = co_occurrence.tocoo()
         cov_data = (coo.data - expected[coo.row, coo.col]) / n
         
         # Compute standard deviations
         std_X = np.sqrt(np.maximum((x_sum * (n - x_sum)) / (n * n), 1e-10))
-        std_Y = np.sqrt(np.maximum((y_sum * (n - y_sum)) / (n * n), 1e-10))
+        std_Y = np.sqrt(np.maximum((np.asarray(Y.sum(axis=0)).ravel() * (n - np.asarray(Y.sum(axis=0)).ravel())) / (n * n), 1e-10))
         
         # Compute correlations only for non-zero covariances
         corr_data = cov_data / (std_X[coo.row] * std_Y[coo.col])
@@ -201,33 +154,34 @@ class PharmacovigSyntheticGenerator:
 
     def _compute_triple_covariance(self, X, Y, Z):
         """
-        Compute three-way covariance tensor using efficient sparse operations.
+        Compute three-way covariance tensor using conditional probabilities
         """
         n = float(X.shape[0])
         
-        # Compute co-occurrences
-        XY = X.T.dot(Y)  # Sparse matrix
-        YZ = Y.T.dot(Z)  # Changed from Y.multiply(Z) to Y.T.dot(Z)
-        XZ = X.T.dot(Z)  # Compute direct X to Z relationship
+        # Compute pairwise conditional probabilities
+        XY_probs = self._compute_conditional_probabilities(X, Y)  # P(Y|X)
+        YZ_probs = self._compute_conditional_probabilities(Y, Z)  # P(Z|Y)
+        XZ_probs = self._compute_conditional_probabilities(X, Z)  # P(Z|X)
         
-        # Marginal sums
-        x_sum = np.asarray(X.sum(axis=0)).ravel()
-        y_sum = np.asarray(Y.sum(axis=0)).ravel()
-        z_sum = np.asarray(Z.sum(axis=0)).ravel()
-        
-        # Convert XZ to COO format for processing
+        # Actual co-occurrences
+        XZ = X.T.dot(Z)
         XZ_coo = XZ.tocoo()
         
-        # Expected counts under independence
-        # For each non-zero entry, compute expected value
+        # Expected counts using chain rule: P(Z|X,Y) ≈ P(Z|X)P(Y|X)P(Z|Y)
+        x_sum = np.asarray(X.sum(axis=0)).ravel()
         expected_data = np.zeros_like(XZ_coo.data, dtype=float)
+        
         for idx, (i, j, val) in enumerate(zip(XZ_coo.row, XZ_coo.col, XZ_coo.data)):
-            expected_data[idx] = (x_sum[i] * z_sum[j]) / n
+            # Combine conditional probabilities
+            p_z_given_x = XZ_probs[i, j]
+            p_y_given_x = XY_probs[i, :].data  # Get non-zero entries
+            p_z_given_y = YZ_probs[:, j].data  # Get non-zero entries
+            
+            # Weighted average of the paths X->Z and X->Y->Z
+            expected_data[idx] = (p_z_given_x + np.mean(p_y_given_x * p_z_given_y)) / 2 * x_sum[i]
         
-        # Compute covariance
+        # Rest of computation remains similar
         cov_data = (XZ_coo.data - expected_data) / n
-        
-        # Handle negative covariances if desired
         cov_data = np.maximum(cov_data, 0)
         
         # Normalize to probabilities using softmax
@@ -434,9 +388,9 @@ class PharmacovigSyntheticGenerator:
         
         # Prepare confounded data
         confounded_data = {
-            'drugs': drugs,
-            'reactions': list(confounded_reactions),
-            'indications': list(indications)
+            'drugs': [int(d) for d in drugs],
+            'reactions': [int(r) for r in list(confounded_reactions)],
+            'indications': [int(i) for i in list(indications)]
         }
         
         print("Report generation complete")
